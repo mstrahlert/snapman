@@ -1,0 +1,181 @@
+#!/bin/sh
+#
+# magnus.strahlert@run.se @ 140622:
+#   snapshot manager for lvm
+# magnus.strahlert@run.se @ 140629:
+#   first version
+# magnus.strahlert@run.se @ 150423:
+#   regexp didn't match October
+#
+
+# Defaults
+#######################
+_VG=VolGroup01
+_LV=LogVol00
+_TTL=1d
+_MNT=/mnt
+_SIZE=25G
+_CHUNK=64
+#######################
+#
+
+usage() {
+  cat << EOF
+Syntax: $0 <command> [options]
+
+Commands:
+  list
+    Lists all snapshots
+
+  mount [ -n snapshot-name ] [ -m mountpoint ] [ -g volgroup ]
+    Mounts a snapshot by name. If no name is given,
+    mount the most recent one. If no mountpoint is
+    given the default ${_MNT} will be used.
+    
+  umount
+    Unmounts a previously mounted snapshot.
+
+  snap [ -t ttl ] [ -g volgroup ] [ -v volume ] [ -s size ]
+    Takes a snapshot. TTL is composed of one or several
+    units of a number and a modifier. Example given 4h or
+    1d10h. If no TTL is given, a default of ${_TTL} is used.
+
+  delete [ -n snapshot-name ] [ -g volgroup ]
+    Deletes a snapshot by name. If no name is given,
+    snapshots are deleted according to TTL-rules.
+EOF
+}
+
+date2time() {
+  _date=`echo "$1"|tr '_.' ' :'`
+  date --date "${_date}" +%s
+}
+
+time2str() {
+  echo "$1"|sed 's/y/*31536000+/g; s/m/*2592000+/g; s/w/*604800+/g; s/d/*86400+/g; s/h/*3600+/g; s/M/*60+/g; s/s//g; s/\+$//'|bc -l
+}
+
+# 04:00
+# 12:00
+# 20:00
+
+case $1 in
+  help|"")
+    usage
+    exit 0
+
+    ;;
+  mount)
+    shift
+    # Mounts a snapshot as a readonly filesystem
+    while getopts "n:m:" option; do
+      case "${option}" in
+        n) _snapshotname=${OPTARG} ;;
+        m) _mountpoint=${OPTARG} ;;
+        g) _VG=${OPTARG} ;;
+        *) : ;;
+      esac
+    done
+
+    # If no snapshot name is given, find out the most recently created one
+    if [ -z "${_snapshotname}" ]; then
+      _snapshotname=`lvs --noheadings --sort -lv_time --options lv_name ${_VG}|egrep "snap[0-9]{4}-[01][0-9]-[0-3][0-9]_[0-2][0-9]\.[0-5][0-9]\.[0-5][0-9]"|tail -1|awk '{print $1}'`
+    fi
+
+    # If no mountpoint is given, use the default
+    if [ -z "${_mountpoint}" ]; then
+      _mountpoint=${_MNT}
+    fi
+
+    # Mount the snapshot readonly
+    mount -o ro,nouuid /dev/${_VG}/${_snapshotname} ${_mountpoint}
+    ;;
+
+  umount|unmount)
+    # Find out if there are any mounted snapshot that matches
+    # our name standard and if so unmount it.
+    mnt=`mount|egrep "${_VG}-snap[0-9]{4}--[01][0-9]--[0-3][0-9]_[0-2][0-9]\.[0-5][0-9]\.[0-5][0-9]"|awk '{print $3}'`
+    if [ -d "${mnt}" ]; then
+      umount ${mnt}
+    else
+      echo "Error: Couldn't find a mounted snapshot"
+      exit 1
+    fi
+
+    ;;
+
+  list)
+    # Only list snapshots that matches our name standard
+    lvs ${_VG}|egrep -e 'snap[0-9]{4}-[01][0-9]-[0-3][0-9]_[0-2][0-9]\.[0-5][0-9]\.[0-5][0-9]'
+    ;;
+
+  delete)
+    shift
+    # lvremove -f snapshot
+    while getopts "n:" option; do
+      case "${option}" in
+        n) _snapshotname=${OPTARG} ;;
+        g) _VG=${OPTARG} ;;
+        *) : ;;
+      esac
+    done
+
+    # If snapshot name is given, try to delete that.
+    # Error handling is left to lvremove(8)
+    if [ -n "${_snapshotname}" ]; then
+      lvremove -f /dev/${_VG}/"${_snapshotname}"
+      break
+    fi
+
+    # Find out which snapshots matches our name standard
+    # and check if any of those ttl are due for deletion
+    lvs --noheadings --sort -lv_time --options lv_name|grep snap|awk '{print $1}'|cut -c 5-|while read _snapname; do
+      if [ -n "`echo ${_snapname}|sed -n 's/^[0-9]\{4\}-[01][0-9]-[0-3][0-9]_[0-2][0-9]\.[0-5][0-9]\.[0-5][0-9]--\([0-9]\+[ymwdhMs]\)\+$/&/p'`" ]; then
+        _date="`echo ${_snapname}|cut -c -19`"
+        _date="`date2time ${_date}`"
+        _ttl="`echo ${_snapname}|cut -c 22-`"
+        _ttl="`time2str ${_ttl}`"
+        _datecur="`date +%s`"
+
+        if [ $((_date + _ttl)) -lt $((_datecur)) ]; then
+          lvremove -f /dev/${_VG}/snap${_snapname}
+        fi
+      fi
+    done
+   
+    ;;
+
+  snap)
+    shift
+    # snap2014-06-28_20.10.00--24h
+    # lvcreate --size 100M --snapshot --name snapXXXX /dev/vg_repo/lv_repo
+    while getopts "t:" option; do
+      case "${option}" in
+        t) _ttl=${OPTARG} ;;
+        g) _VG=${OPTARG} ;;
+        v) _LV=${OPTARG} ;;
+        s) _SIZE=${OPTARG} ;;
+        *) : ;;
+      esac
+    done
+
+    # Check if ttl given is valid. If no ttl is given, use the default
+    if [ -n "${_ttl}" ]; then
+      if [ -z "`echo ${_ttl}|sed -n 's/^\([0-9]\+[ymwdhMs]\)\+$/&/p'`" ]; then
+        echo "Error: Invalid ttl"
+        exit 2
+      fi
+    else
+      _ttl=${_TTL}
+    fi
+
+    # Create the snapshot with a predefined size and name that
+    # conforms to our name standard of "snap<date>_<time>--<ttl>"
+    lvcreate --size ${_SIZE} --chunksize ${_CHUNK} --snapshot --name snap`date +"%F %T"|tr ' :' '_.'`--${_ttl} /dev/${_VG}/${_LV}
+    ;;
+
+  *)
+    echo "Error: Unsupported subcommand"
+    exit 1
+    ;;
+esac
